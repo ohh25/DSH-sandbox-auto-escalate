@@ -1,0 +1,13 @@
+# 依赖（本插件零依赖，这里只防手滑）
+node_modules/
+
+# 运行时产物
+*.log
+*.tmp
+.bak
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
