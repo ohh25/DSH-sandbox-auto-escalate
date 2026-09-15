@@ -1,4 +1,4 @@
-# sandbox-auto-escalate
+# DSH-sandbox-auto-escalate
 
 > DSH 插件 · 沙箱挡住工具调用时，自动在**同一轮内**以更宽模式重试，并弹出一次授权确认 —— 模型不必为「失败一次再重试」多花一轮。
 
