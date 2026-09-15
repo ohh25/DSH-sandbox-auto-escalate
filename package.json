@@ -16,6 +16,15 @@
     }
   },
   "license": "MIT",
+  "author": "ohh25",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ohh25/sandbox-auto-escalate.git"
+  },
+  "homepage": "https://github.com/ohh25/sandbox-auto-escalate#readme",
+  "bugs": {
+    "url": "https://github.com/ohh25/sandbox-auto-escalate/issues"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",

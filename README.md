@@ -181,12 +181,31 @@ $node = "<DSH 安装目录>\resources\app\node_modules\node\bin\node.exe"
 ## 结构
 
 ```
-index.js        宿主半：触发规则 + 配置 + 设置 namespace 注册
-client.js       浏览器半：设置页（lazy-CJS factory bundle，纯 JS 无 JSX）
-package.json    同时声明 exports["./client"] 与 dsh.client
-install.ps1     安装 / 卸载（幂等）
-selftest.mjs    离线自测：精确复刻 cordis waterfall 语义
+index.js          宿主半：触发规则 + 配置 + 设置 namespace 注册
+client.js         浏览器半：设置页（lazy-CJS factory bundle，纯 JS 无 JSX）
+package.json      同时声明 exports["./client"] 与 dsh.client
+install.ps1       安装 / 卸载（幂等）
+selftest.mjs      离线自测：精确复刻 cordis waterfall 语义
+LICENSE           MIT
+.gitignore        依赖 / 运行时产物
+.gitattributes    仓库内统一 LF，避免跨平台 diff 噪音
 ```
+
+## 维护备注：Windows PowerShell 5.1 的三个坑
+
+写 `install.ps1` 时实测踩到的，都已规避。想在别的机器上复刻这套脚本，先看这里。
+
+1. **无 BOM 的 `.ps1` 会按系统 ANSI 码页读取**（本机是 GBK）。脚本里写中文会被解析成乱码并**直接语法报错**，实测报
+   `Missing ')' in function parameter list` 或 `The string is missing the terminator`。
+   所以脚本刻意保持**纯 ASCII**；中文只放在 README 与 JS 文件里 —— 它们始终按 UTF-8 读。
+
+2. **`$PSScriptRoot` 在 `param()` 默认值里是空的。** 这是 PowerShell 5.1 的怪癖（PS Core 才修），
+   `[string]$Dir = (Join-Path $PSScriptRoot 'x')` 会抛
+   `Cannot bind argument to parameter 'Path' because it is an empty string`。
+   必须在**函数体**里用 `Split-Path -Parent $MyInvocation.MyCommand.Path` 解析。
+
+3. **写回 YAML 不能用 `Set-Content -Encoding UTF8`**：PS 5.1 的 `UTF8` 会带 BOM，而 profile 自带的
+   `cordis.patch.yml` 无 BOM。`install.ps1` 统一走 `[System.IO.File]::WriteAllText` + `UTF8Encoding($false)`。
 
 ## 许可
 
