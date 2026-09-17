@@ -208,6 +208,13 @@ window.__ModuleLoader__.load({
             disabled: !writable,
             onChange: (on) => set('triggerPwshInitFailure', on),
           }),
+          e(CheckRow, {
+            label: '后台命令预先升级',
+            hint: '后台任务是「先启动、失败事后才暴露」，插件来不及救 —— 所以这类调用必须在启动前就升级。关掉它，后台 pwsh 必定失败。',
+            checked: value.preEscalateBackground !== false,
+            disabled: !writable,
+            onChange: (on) => set('preEscalateBackground', on),
+          }),
         ),
       )
 

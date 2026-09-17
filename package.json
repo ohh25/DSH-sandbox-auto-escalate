@@ -1,6 +1,6 @@
 {
   "name": "sandbox-auto-escalate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "DSH plugin: when a tool call is blocked by the sandbox, automatically re-dispatch it with wider permissions so the existing approval UI asks the user once — no wasted model round-trip. Ships a settings page for choosing which tool kinds and failure modes escalate.",
   "type": "module",

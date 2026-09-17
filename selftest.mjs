@@ -19,7 +19,7 @@
  * 运行：node selftest.mjs
  */
 
-import { apply } from './index.js'
+import { apply, redactSecrets } from './index.js'
 
 // ---------------------------------------------------------------- 测试脚手架
 
@@ -453,6 +453,134 @@ console.log('\n[22] 设置文档的值覆盖组合配置')
   check('schema 由 buildSettingsSchema 构建', registered?.schema?.kind === 'object', JSON.stringify(Object.keys(registered?.schema ?? {})))
   check('组合 config 作为 base 层传入', registered?.options?.base?.targetMode === 'danger-full-access', JSON.stringify(registered?.options))
   check('升级目标取自设置文档而非组合配置', seen[1]?.sandbox_permissions === 'workspace-write', JSON.stringify(seen[1]))
+}
+
+// ------------------------------------------------ 后台预先升级（新增）
+
+/** 造一个能提供 sandboxPolicy 的假 ctx，用来驱动「派发前预先升级」。 */
+function makeContextWithPolicy(mode) {
+  const ctx = makeContext()
+  ctx.inject = (dependencies, callback) => {
+    if (Array.isArray(dependencies) && dependencies.includes('sandboxPolicy')) {
+      callback({ sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: 'C:\\ws' }) } })
+    }
+  }
+  return ctx
+}
+
+/** 驱动一次后台调用；返回 body 实际看到的参数。 */
+async function driveBackground(options = {}) {
+  const { policyMode = 'workspace-write', config = {}, toolName = 'pwsh', usePolicy = true } = options
+  const ctx = usePolicy ? makeContextWithPolicy(policyMode) : makeContext()
+  const seen = []
+  apply(ctx, config)
+  const exec = {
+    name: toolName,
+    callId: 'c',
+    agent: {},
+    signal: { aborted: false },
+    arguments: Object.freeze({ command: 'x', run_in_background: true }),
+  }
+  const result = await ctx.waterfall('tools/execute', exec, async () => {
+    seen.push({ ...exec.arguments })
+    return success('started background job pwsh-1')
+  })
+  return { seen, result }
+}
+
+console.log('\n[23] 后台调用在派发前预先升级')
+{
+  const { seen, result } = await driveBackground()
+  check('body 只被调用一次（无重试）', seen.length === 1, `实际 ${seen.length}`)
+  check('派发前就注入了升级参数', seen[0]?.sandbox_permissions === 'danger-full-access', JSON.stringify(seen[0]))
+  check('justification 说明是后台', /后台/.test(seen[0]?.justification ?? ''), seen[0]?.justification)
+  check('保留 run_in_background', seen[0]?.run_in_background === true)
+  check('返回的是 job 句柄', result.isError === false && result.content[0].text.includes('background job'))
+}
+
+console.log('\n[24] 非后台调用不预先升级')
+{
+  const ctx = makeContextWithPolicy('workspace-write')
+  const seen = []
+  apply(ctx, {})
+  const exec = { name: 'pwsh', callId: 'c', agent: {}, signal: { aborted: false }, arguments: Object.freeze({ command: 'x' }) }
+  await ctx.waterfall('tools/execute', exec, async () => {
+    seen.push({ ...exec.arguments })
+    return success('done')
+  })
+  check('没有注入升级参数', seen[0]?.sandbox_permissions === undefined, JSON.stringify(seen[0]))
+}
+
+console.log('\n[25] 已在 danger-full-access -> 不预先升级')
+{
+  const { seen } = await driveBackground({ policyMode: 'danger-full-access' })
+  check('没有注入升级参数', seen[0]?.sandbox_permissions === undefined, JSON.stringify(seen[0]))
+}
+
+console.log('\n[26] sandboxPolicy 缺席 -> 不预先升级，也不崩')
+{
+  const { seen, result } = await driveBackground({ usePolicy: false })
+  check('没有注入升级参数', seen[0]?.sandbox_permissions === undefined, JSON.stringify(seen[0]))
+  check('调用照常完成', result.isError === false)
+}
+
+console.log('\n[27] preEscalateBackground=false -> 后台也不预先升级')
+{
+  const { seen } = await driveBackground({ config: { preEscalateBackground: false } })
+  check('没有注入升级参数', seen[0]?.sandbox_permissions === undefined, JSON.stringify(seen[0]))
+}
+
+console.log('\n[28] preEscalateTools 不含该工具 -> 不预先升级')
+{
+  const { seen } = await driveBackground({ toolName: 'bash' })
+  check('pwsh 之外的工具不预先升级', seen[0]?.sandbox_permissions === undefined, JSON.stringify(seen[0]))
+}
+
+// ----------------------------------------------------- 凭据抹除（新增）
+
+// ⚠️ 夹具一律**运行时拼接**，绝不在源码里写字面量。
+// 原因：这些夹具本身长得就像真凭据，一旦落成字面量，
+// 「推送前密钥扫描」会（正确地）拦下整个仓库 —— 而把真凭据抄进测试源码，
+// 正是本插件要防的那类错误本身。
+const FAKE_GITHUB = 'gho_' + 'A'.repeat(32)
+const FAKE_JINA = 'jina_' + 'B'.repeat(40)
+const FAKE_OPENAI = 'sk-' + 'C'.repeat(24)
+
+console.log('\n[29] 命令里内联的凭据不会落进审批理由/日志')
+{
+  const secret = FAKE_GITHUB
+  const ctx = makeContext()
+  const seen = []
+  apply(ctx, {})
+  const exec = {
+    name: 'pwsh',
+    callId: 'c',
+    agent: {},
+    signal: { aborted: false },
+    arguments: Object.freeze({ command: `$t="${secret}"; Invoke-RestMethod -Headers @{Authorization="Bearer ${secret}"} https://api.github.com/user` }),
+  }
+  await ctx.waterfall('tools/execute', exec, async () => {
+    seen.push({ ...exec.arguments })
+    if (exec.arguments.sandbox_permissions !== undefined) return success('ok')
+    return { isError: false, content: [{ type: 'text', text: '[sandbox: file access denied under workspace-write mode]' }] }
+  })
+  const justification = seen[1]?.justification ?? ''
+  check('justification 里没有 token 原文', !justification.includes(secret), justification)
+  check('留下了红色标记', justification.includes('REDACTED') || justification.includes('***'), justification)
+}
+
+console.log('\n[30] redactSecrets 覆盖常见凭据形态')
+{
+  const gh = redactSecrets('token=' + FAKE_GITHUB)
+  check('GitHub token 被抹掉', !gh.includes(FAKE_GITHUB), gh)
+  const jina = redactSecrets('$key = "' + FAKE_JINA + '"')
+  check('Jina key 被抹掉', !jina.includes(FAKE_JINA), jina)
+  const bearer = redactSecrets('Authorization=Bearer ' + FAKE_OPENAI)
+  check('Bearer / sk- 被抹掉', !bearer.includes(FAKE_OPENAI), bearer)
+  const url = redactSecrets('git clone https://ohh25:' + 'D'.repeat(24) + '@github.com/o/r.git')
+  check('URL 里的 user:pass 被抹掉', !url.includes('D'.repeat(24)), url)
+  const plain = redactSecrets('Get-Date -Format yyyy-MM-dd')
+  check('普通命令保持原样', plain === 'Get-Date -Format yyyy-MM-dd', plain)
 }
 
 // ------------------------------------------------------------------- 汇总

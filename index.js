@@ -72,6 +72,16 @@ export const DEFAULT_CONFIG = {
   triggerSandboxDenial: true,
   /** 触发规则：pwsh 在进程初始化阶段被沙箱打断（0xC0000142）。 */
   triggerPwshInitFailure: true,
+  /**
+   * 触发规则：**后台**调用在派发前就预先升级。
+   *
+   * 后台分支是「先启动进程、失败事后才从 job 输出暴露」，插件的后置升级永远看不到
+   * 那次失败 —— 实测后台 pwsh 会以 0xC0000142 静默失败，带上升级参数则 exit 0。
+   * 所以这类调用必须在派发前就把参数注进去，事后补救没有机会。
+   */
+  preEscalateBackground: true,
+  /** 需要「后台预先升级」的工具种类。 */
+  preEscalateTools: ['pwsh'],
   /** 视为“初始化失败”的退出码。默认只含 0xC0000142 (STATUS_DLL_INIT_FAILED)。 */
   initFailureExitCodes: [3221225794],
   /**
@@ -97,6 +107,7 @@ export function buildSettingsSchema(z) {
     tools: z.array(z.string()).default(DEFAULT_CONFIG.tools),
     triggerSandboxDenial: z.boolean().default(DEFAULT_CONFIG.triggerSandboxDenial),
     triggerPwshInitFailure: z.boolean().default(DEFAULT_CONFIG.triggerPwshInitFailure),
+    preEscalateBackground: z.boolean().default(DEFAULT_CONFIG.preEscalateBackground),
   })
 }
 
@@ -208,14 +219,39 @@ function exitCodeOf(result) {
   return match === null ? undefined : Number(match[1])
 }
 
-/** 给用户看的一行调用摘要——进审批窗的 reason，太长就截断。 */
+/**
+ * 从「将要写进日志 / 审批理由」的文本里抹掉疑似凭据。
+ *
+ * ⚠️ **这是必须的，不是可选的美化。** 日志行里带完整命令行，而模型经常把 token
+ * 直接内联进命令里 —— 实测本机日志里躺着明文 GitHub token 与 Jina API key，
+ * 来源就是本插件这行日志。凭据一旦落盘就只能轮换，所以必须在写之前抹掉。
+ * @param {unknown} text - 原始文本。
+ * @returns {string} 抹掉疑似凭据后的文本。
+ */
+export function redactSecrets(text) {
+  return String(text)
+    // GitHub 各类 token（ghp_/gho_/ghu_/ghs_/ghr_）
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{16,}/g, 'gh*_REDACTED')
+    // 带服务前缀的密钥
+    .replace(/\bjina_[A-Za-z0-9_-]{16,}/g, 'jina_REDACTED')
+    .replace(/\bsk-[A-Za-z0-9_-]{16,}/g, 'sk-REDACTED')
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, 'xox*_REDACTED')
+    // 具名赋值：token / secret / password / api_key = ...
+    .replace(/((?:token|secret|password|passwd|api[_-]?key|access[_-]?key|auth)\s*[:=]\s*)(["']?)([^\s"';,]{6,})/gi, '$1$2***')
+    // URL 里的 user:pass@
+    .replace(/(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1***@')
+    // Authorization / Bearer 头
+    .replace(/((?:authorization|bearer)\s*[:=]?\s*)(["']?)([A-Za-z0-9._~+/-]{8,}=*)/gi, '$1$2***')
+}
+
+/** 给用户看的一行调用摘要——进审批窗的 reason 与插件日志，太长就截断。 */
 function describeCall(exec, args) {
   const raw =
     (typeof args.command === 'string' && args.command) ||
     (typeof args.description === 'string' && args.description) ||
     (typeof args.path === 'string' && args.path) ||
     exec.name
-  const oneLine = String(raw).replace(/\s+/g, ' ').trim()
+  const oneLine = redactSecrets(raw).replace(/\s+/g, ' ').trim()
   return oneLine.length > 160 ? `${oneLine.slice(0, 157)}…` : oneLine
 }
 
@@ -231,6 +267,10 @@ function normalizeConfig(raw) {
     tools: Array.isArray(input.tools) ? input.tools.filter((tool) => typeof tool === 'string') : [...DEFAULT_CONFIG.tools],
     triggerSandboxDenial: input.triggerSandboxDenial !== false,
     triggerPwshInitFailure: input.triggerPwshInitFailure !== false,
+    preEscalateBackground: input.preEscalateBackground !== false,
+    preEscalateTools: Array.isArray(input.preEscalateTools)
+      ? input.preEscalateTools.filter((tool) => typeof tool === 'string')
+      : [...DEFAULT_CONFIG.preEscalateTools],
     initFailureExitCodes: codes.length > 0 ? codes : [...DEFAULT_CONFIG.initFailureExitCodes],
     fallbackMode: typeof input.fallbackMode === 'string' ? input.fallbackMode : DEFAULT_CONFIG.fallbackMode,
   }
@@ -312,7 +352,9 @@ export function apply(ctx, config = {}, internals = {}) {
       const scope = sctx.settings.register(SETTINGS_NAMESPACE, buildSettingsSchema(z), { base: config })
       const sync = () => {
         try {
-          current = normalizeConfig(scope.get())
+          // 组合 config 作为地板：schema 里没声明的字段（initFailureExitCodes /
+          // fallbackMode / preEscalateTools）不会被设置文档带出来，不铺这层会丢。
+          current = normalizeConfig({ ...config, ...scope.get() })
         } catch (error) {
           warn(`settings read failed: ${error?.message ?? String(error)}`)
         }
@@ -324,7 +366,60 @@ export function apply(ctx, config = {}, internals = {}) {
     }
   })
 
+  // sandboxPolicy 用来判断这次调用当前是否真的被限制。缺席就不预先升级 ——
+  // 宁可不做，也不要靠猜模式去发一个可能非法的升级请求。
+  let sandboxPolicy
+  ctx.inject(['sandboxPolicy'], (sctx) => {
+    sandboxPolicy = sctx.sandboxPolicy
+  })
+
+  /**
+   * 后台调用在**派发前**预先升级。
+   *
+   * 后台分支由 `dsh-tool-pwsh` 先 `jobs.start(...)` 再 `ctx.shell.start(...)`：
+   * 升级参数必须在 `execute()` 里就已经存在。失败只会事后出现在 job 输出里，
+   * 后置逻辑没有任何介入机会 —— 这正是「后台 pwsh 永远失败」的成因。
+   * 实测：后台 pwsh 在 workspace-write 下 exit 3221225794 (0xC0000142)，
+   * 带上 `sandbox_permissions` 后 exit 0。
+   * @param {object} exec - 本次工具执行（可变）。
+   */
+  function preEscalateBackgroundCall(exec) {
+    if (current.enabled !== true || current.preEscalateBackground !== true) return
+    if (!isPlainObject(exec) || retried.has(exec)) return
+    if (exec.signal?.aborted === true) return
+    if (!current.preEscalateTools.includes(exec.name)) return
+
+    const args = exec.arguments
+    if (!isPlainObject(args)) return
+    if (args.run_in_background !== true) return
+    if (args.sandbox_permissions !== undefined || args.justification !== undefined) return
+
+    if (sandboxPolicy === undefined) {
+      warn(`cannot pre-escalate background "${String(exec.name)}": sandboxPolicy unavailable`)
+      return
+    }
+    const resolved = sandboxPolicy.resolve(exec.agent === undefined ? {} : { session: exec.agent.session })
+    const mode = isPlainObject(resolved) ? resolved.mode : undefined
+    const ladder = typeof mode === 'string' ? WIDER_MODES[mode] : undefined
+    // 已经是 danger-full-access（或模式读不出来）→ 没什么可升的。
+    if (ladder === undefined || ladder.length === 0) return
+
+    const target = ladder.includes(current.targetMode) ? current.targetMode : ladder[ladder.length - 1]
+    const justification = `后台 ${exec.name} 在 ${mode} 沙箱下会死在进程初始化阶段（0xC0000142），预先请求以 ${target} 运行：${describeCall(exec, args)}`
+
+    // 记进 retried：后置逻辑不必再插手这次调用。
+    retried.add(exec)
+    exec.arguments = { ...args, sandbox_permissions: target, justification }
+    warn(`pre-escalating background "${String(exec.name)}" to ${target}: ${describeCall(exec, args)}`)
+  }
+
   ctx.on('tools/execute', async (exec, next) => {
+    // 后台调用必须赶在派发之前 —— 事后补救没有机会。
+    try {
+      preEscalateBackgroundCall(exec)
+    } catch (error) {
+      warn(`background pre-escalation failed for "${String(exec?.name)}": ${error?.message ?? String(error)}`)
+    }
     const first = await next()
     try {
       return (await maybeEscalate(exec, next, first)) ?? first

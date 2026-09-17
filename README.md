@@ -64,6 +64,27 @@ DSH 原生行为是「**失败 → 由模型重试**」：
 
 升级到 `danger-full-access` 后 pwsh 恢复正常。
 
+## 后台调用：必须**预先**升级
+
+后台分支由 `dsh-tool-pwsh` 先 `jobs.start(...)` 再 `ctx.shell.start(...)` —— 升级参数必须在
+`execute()` 里就已经存在。失败只会事后出现在 **job 输出**里，而那段输出是模型用 `job_output`
+读的，**根本不经过 `tools/execute`**，所以**后置**升级对后台没有任何介入点。
+
+实测对照（后台 pwsh）：
+
+| 是否带升级参数 | 退出码 | 输出 |
+|---|---|---|
+| 否 | `3221225794` (0xC0000142) | 空 |
+| 是 | `0` | 正常 |
+
+所以 `preEscalateBackground` 会在 `tools/execute` 里**派发之前**注入参数。当前模式通过
+`ctx.inject(['sandboxPolicy'])` 读取；**读不到就不升** —— 宁可不做，也不靠猜去发一个可能
+非法的升级请求。
+
+> 顺带澄清一个容易误判的点：`jobs` 运行时本身没问题（`dsh-jobs-local` id `jobs` 与
+> `dsh-tool-jobs` id `tool-jobs` 在 `dsh-base` 里是组合好的，作业能正常启动/跟踪/收尾）。
+> 「后台任务坏了」的真实表现是**后台子进程被沙箱杀死**。
+
 ## 实测验证记录
 
 两条规则都已在真机端到端跑通：
@@ -72,6 +93,8 @@ DSH 原生行为是「**失败 → 由模型重试**」：
 |---|---|---|---|
 | `pwshInitFailure` | `pwsh` 执行 `Get-Date` | ✅ 输出 `2026-09-15 14:36:01` | `escalating "pwsh" (pwshInitFailure) to danger-full-access` |
 | `sandboxDenial` | `write` 到会话工作区之外 | ✅ 文件创建成功 | `escalating "write" (sandboxDenial) to danger-full-access` |
+| `preEscalateBackground` | `run_in_background` 的 pwsh | ✅ `exit 0` + 正常输出 | `pre-escalating background "pwsh" to danger-full-access` |
+| 凭据抹除 | 命令内联 `gho_AAAA…`（假 token） | ✅ 日志里只剩 `gh*_REDACTED` | — |
 
 关键前提也核对过：会话策略确认为 `workspace-write`（**没变过**），而沙箱仍在强制执行（`pwsh` 依旧死于 `0xC0000142` —— 沙箱若失效它反而会活过来）。也就是说，同一个被拒的操作从「失败」变成「成功」，唯一的新变量就是本插件。
 
@@ -132,6 +155,8 @@ $node = "<DSH 安装目录>\resources\app\node_modules\node\bin\node.exe"
 | `tools` | `[]` | 允许自动升级的工具种类；**空 = 不限制** |
 | `triggerSandboxDenial` | `true` | 沙箱拒绝标记 |
 | `triggerPwshInitFailure` | `true` | pwsh 进程初始化失败 |
+| `preEscalateBackground` | `true` | 后台调用在派发前预先升级（见上） |
+| `preEscalateTools` | `['pwsh']` | 需要「后台预先升级」的工具种类 |
 | `initFailureExitCodes` | `[3221225794]` | 视为「初始化失败」的退出码（高级项） |
 | `fallbackMode` | `workspace-write` | 读不出沙箱模式时的兜底（高级项） |
 
@@ -164,6 +189,20 @@ $node = "<DSH 安装目录>\resources\app\node_modules\node\bin\node.exe"
 1. **`exec.arguments` 是深冻结的**（`createExecution` 里 `deepFreeze`），只能**整体替换**成新对象，不能改属性。
 2. **重试会跳过注册在外层的 `tools/execute` 包装器**（checkpoint / timeout policy）—— 它们只在第一次走链时被消费。副作用：重试那次不受 `tool-call-timeout-policy` 包装，但仍受工具自身 `timeoutMs` 约束。
 3. **不要在模块顶层 `import` schemastery**。那样会让 `index.js` 在 profile 之外（例如在工作区里直接跑自测）加载即失败，把一个零依赖插件绑上硬依赖。
+
+## 凭据抹除
+
+日志行与审批理由里都会带**命令全文**，而模型经常把 token 直接内联进命令里。所以
+`redactSecrets()` 会在文本落进日志 / 审批理由**之前**抹掉：
+
+- GitHub 各类 token（`ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_`）
+- `jina_` / `sk-` / `xox*` 前缀密钥
+- 具名赋值（`token=` / `api_key=` / `secret=` / `password=` …）
+- URL 里的 `user:pass@`
+- `Authorization` / `Bearer` 头
+
+> 这不是美化，是**必须**的：这条日志行曾经把明文 GitHub token 与 API key 写进过磁盘。
+> 凭据一旦落盘就只能轮换，所以只能在写入前抹掉。用例 `[29]` / `[30]` 专门守着这个行为。
 
 ## 已知边界
 
