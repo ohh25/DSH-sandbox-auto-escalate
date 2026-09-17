@@ -19,11 +19,11 @@
   "author": "ohh25",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ohh25/sandbox-auto-escalate.git"
+    "url": "git+https://github.com/ohh25/DSH-sandbox-auto-escalate.git"
   },
-  "homepage": "https://github.com/ohh25/sandbox-auto-escalate#readme",
+  "homepage": "https://github.com/ohh25/DSH-sandbox-auto-escalate#readme",
   "bugs": {
-    "url": "https://github.com/ohh25/sandbox-auto-escalate/issues"
+    "url": "https://github.com/ohh25/DSH-sandbox-auto-escalate/issues"
   },
   "keywords": [
     "deepseek-harness",
